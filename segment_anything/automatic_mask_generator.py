@@ -134,7 +134,7 @@ class SamAutomaticMaskGenerator:
         self.output_mode = output_mode
 
     @torch.no_grad()
-    def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
+    def generate(self, image: np.ndarray = None, embedding: torch.Tensor = None, orig_size: List[int] = None) -> List[Dict[str, Any]]:
         """
         Generates masks for the given image.
 
@@ -158,9 +158,8 @@ class SamAutomaticMaskGenerator:
                crop_box (list(float)): The crop of the image used to generate
                  the mask, given in XYWH format.
         """
-
         # Generate masks
-        mask_data = self._generate_masks(image)
+        mask_data = self._generate_masks(image, embedding, orig_size)
 
         # Filter small disconnected regions and holes in masks
         if self.min_mask_region_area > 0:
@@ -194,16 +193,15 @@ class SamAutomaticMaskGenerator:
 
         return curr_anns
 
-    def _generate_masks(self, image: np.ndarray) -> MaskData:
-        orig_size = image.shape[:2]
+    def _generate_masks(self, image: np.ndarray, embedding: torch.Tensor, orig_size: List[int]) -> MaskData:
+        orig_size = image.shape[:2] if image is not None else orig_size
         crop_boxes, layer_idxs = generate_crop_boxes(
             orig_size, self.crop_n_layers, self.crop_overlap_ratio
         )
-
         # Iterate over image crops
         data = MaskData()
         for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
-            crop_data = self._process_crop(image, crop_box, layer_idx, orig_size)
+            crop_data = self._process_crop(image, crop_box, layer_idx, orig_size, embedding)
             data.cat(crop_data)
 
         # Remove duplicate masks between crops
@@ -228,12 +226,29 @@ class SamAutomaticMaskGenerator:
         crop_box: List[int],
         crop_layer_idx: int,
         orig_size: Tuple[int, ...],
+        embedding: torch.Tensor
     ) -> MaskData:
-        # Crop the image and calculate embeddings
-        x0, y0, x1, y1 = crop_box
-        cropped_im = image[y0:y1, x0:x1, :]
-        cropped_im_size = cropped_im.shape[:2]
-        self.predictor.set_image(cropped_im)
+
+        if image is not None or embedding is None:
+          # Crop the image and calculate embeddings
+          x0, y0, x1, y1 = crop_box
+          cropped_im = image[y0:y1, x0:x1, :]
+          cropped_im_size = cropped_im.shape[:2]
+          self.predictor.set_image(cropped_im)
+        else:
+          self.predictor.features = embedding
+          self.predictor.is_image_set = True
+          # the long_side_length is hardcoded here to speed things up
+          long_side_length = self.predictor.model.image_encoder.img_size
+          # long_side_length = 1024
+          oldh, oldw = orig_size
+          scale = long_side_length * 1.0 / max(oldh, oldw)
+          newh, neww = oldh * scale, oldw * scale
+          neww = int(neww + 0.5)
+          newh = int(newh + 0.5)
+          self.predictor.input_size = (newh, neww)
+          self.predictor.original_size = orig_size
+          cropped_im_size = orig_size
 
         # Get points for this crop
         points_scale = np.array(cropped_im_size)[None, ::-1]
